@@ -20,7 +20,9 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'detection = task3a.detection:main'
+            'detection = task3a.detection:main',
+            'hsv_calibration = task3a.hsv_calibration:main',
+            
         ],
     },
 )
