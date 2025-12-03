@@ -204,8 +204,8 @@ class OpenCVDepthNode(Node):
     def setup_subs(self):
         # setup subscribers for rgb and depth camera feeds
         try:
-            self.rgb_sub = Subscriber(self, Image, '/camera/image_raw')
-            self.depth_sub = Subscriber(self, Image, '/camera/depth/image_raw')
+            self.rgb_sub = Subscriber(self, Image, '/camera/camera/color/image_raw')
+            self.depth_sub = Subscriber(self, Image, '/camera/camera/aligned_depth_to_color/image_raw')
             
             # synchronize rgb and depth images (they come at slightly different times)
             self.ts = ApproximateTimeSynchronizer(
