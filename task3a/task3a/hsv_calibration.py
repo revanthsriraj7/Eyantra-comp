@@ -38,7 +38,7 @@ class HSVCalibrationNode(Node):
         # Subscribe to RGB camera feed
         self.rgb_sub = self.create_subscription(
             Image,
-            '/camera/image_raw',
+            '/camera/camera/color/image_raw',
             self.image_callback,
             10
         )
