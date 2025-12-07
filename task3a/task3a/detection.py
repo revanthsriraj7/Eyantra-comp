@@ -2,12 +2,14 @@
 # Team ID:          < eYRC#1912 >
 # Theme:            < Krishi coBot >
 # Author List:      < K P R B Revanth Sriraj, Chirag Sharma, Chandan GS >
-# Filename:         < task1b.py >
+# Filename:         < detection.py >
 # Functions:        < CameraIntrinsics.is_valid, DetectionResult.has_valid_3d, OpenCVDepthNode.init, 
 #                      OpenCVDepthNode.setup_params, OpenCVDepthNode.load_params, OpenCVDepthNode.setup_camera, 
-#                      OpenCVDepthNode.setup_detection, OpenCVDepthNode.setup_subs, OpenCVDepthNode.setup_windows, 
+#                      OpenCVDepthNode.setup_detection, OpenCVDepthNode.setup_aruco_detector, 
+#                      OpenCVDepthNode.setup_subs, OpenCVDepthNode.setup_windows, 
 #                      OpenCVDepthNode.convert_pixel_to_world, OpenCVDepthNode.fix_coordinates, OpenCVDepthNode.get_param_or_default, 
-#                      OpenCVDepthNode.publish_fruit_position, OpenCVDepthNode.process_images, OpenCVDepthNode.convert_images, 
+#                      OpenCVDepthNode.publish_fruit_position, OpenCVDepthNode.detect_aruco_markers, 
+#                      OpenCVDepthNode.process_images, OpenCVDepthNode.convert_images, 
 #                      OpenCVDepthNode.find_bad_fruits, OpenCVDepthNode.process_detection, OpenCVDepthNode.get_depth, 
 #                      OpenCVDepthNode.get_depth_at_point, OpenCVDepthNode.show_results, OpenCVDepthNode.draw_detection, 
 #                      OpenCVDepthNode.draw_detection_on_depth, OpenCVDepthNode.make_depth_colormap, OpenCVDepthNode.save_frame, 
@@ -17,9 +19,10 @@
 
 #This code was made by referring example code and boiler code
 
-# Task 1B - Bad Fruit Detection using OpenCV 
-# This code detects bad fruits using camera and depth sensor
-# uses hsv color detection to find grey fruits with green spots
+# Combined Detection - ArUco Markers + Bad Fruits
+# This code detects both ArUco markers and bad fruits using camera and depth sensor
+# Uses ArUco marker detection for objects like fertilizer can (marker ID 3)
+# Uses HSV color detection to find grey fruits with green spots
 
 #!/usr/bin/env python3
 import rclpy
@@ -95,6 +98,7 @@ class OpenCVDepthNode(Node):
         self.tf_buffer = Buffer()  # for coordinate transformations
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.camera_intrinsics: Optional[CameraIntrinsics] = None
+        self.camera_info_received = False  # flag to check if we got camera info
         
         # load all parameters from config
         self.setup_params()
@@ -109,6 +113,9 @@ class OpenCVDepthNode(Node):
         # setup opencv detection with hsv ranges
         self.setup_detection()
         
+        # setup ArUco marker detector
+        self.setup_aruco_detector()
+        
         # setup subscribers for rgb and depth images  
         self.setup_subs()
         
@@ -119,8 +126,15 @@ class OpenCVDepthNode(Node):
         # keep track of how many frames we processed
         self.frame_count = 0
         self.detection_stats = {'total': 0, 'valid_3d': 0, 'invalid_depth': 0}
+        self.aruco_stats = {'total': 0, 'valid_3d': 0}
         
-        self.get_logger().info("fruit detection node started successfully")
+        detection_types = []
+        if self.aruco_enable:
+            detection_types.append("ArUco markers")
+        detection_types.append("bad fruits")
+        
+        self.get_logger().info(f"Combined detection node started successfully!")
+        self.get_logger().info(f"Detecting: {' + '.join(detection_types)}")
     
     def setup_params(self):
         # setup all the parameters with default values
@@ -131,8 +145,15 @@ class OpenCVDepthNode(Node):
         self.declare_parameter('enable_visualization', True)  # show opencv windows or not
         self.declare_parameter('sync_slop', 0.1)  # how much time difference allowed between rgb and depth
         self.declare_parameter('queue_size', 10)
+        self.declare_parameter('use_camera_info', True)  # get intrinsics from camera_info topic
         
-        # camera calibration values (got these from camera calibration)
+        # ArUco detection parameters
+        self.declare_parameter('aruco.enable', True)  # enable ArUco marker detection
+        self.declare_parameter('aruco.min_marker_area', 500)  # minimum marker area to consider valid
+        
+
+        #camera intrinsics values
+        # camera calibration values (fallback defaults if camera_info not available)
         self.declare_parameter('camera.width', 1280)
         self.declare_parameter('camera.height', 720)
         self.declare_parameter('camera.cx', 642.724365234375)  # principal point x
@@ -152,12 +173,30 @@ class OpenCVDepthNode(Node):
         self.enable_visualization = self.get_parameter('enable_visualization').get_parameter_value().bool_value
         self.sync_slop = self.get_parameter('sync_slop').get_parameter_value().double_value
         self.queue_size = self.get_parameter('queue_size').get_parameter_value().integer_value
+        self.use_camera_info = self.get_parameter('use_camera_info').get_parameter_value().bool_value
         
-        self.get_logger().info(f"loaded params: conf={self.confidence_threshold}, max_detect={self.max_detections}")
+        # ArUco parameters
+        self.aruco_enable = self.get_parameter('aruco.enable').get_parameter_value().bool_value
+        self.min_marker_area = self.get_parameter('aruco.min_marker_area').get_parameter_value().integer_value
+        
+        self.get_logger().info(f"loaded params: conf={self.confidence_threshold}, max_detect={self.max_detections}, use_camera_info={self.use_camera_info}, aruco={self.aruco_enable}")
     
     def setup_camera(self):
         # setup camera calibration values
         try:
+            # if use_camera_info is enabled, subscribe to camera_info topic
+            if self.use_camera_info:
+                self.get_logger().info("waiting for camera_info from /camera/camera/color/camera_info...")
+                self.camera_info_sub = self.create_subscription(
+                    CameraInfo,
+                    '/camera/camera/color/camera_info',
+                    self.camera_info_callback,
+                    10
+                )
+                # don't proceed until we get camera info
+                return
+            
+            # otherwise use hardcoded parameters
             self.camera_intrinsics = CameraIntrinsics(
                 width=self.get_parameter('camera.width').get_parameter_value().integer_value,
                 height=self.get_parameter('camera.height').get_parameter_value().integer_value,
@@ -170,12 +209,46 @@ class OpenCVDepthNode(Node):
             if not self.camera_intrinsics.is_valid():
                 raise ValueError("camera parameters are wrong!")
             
-            self.get_logger().info(f"camera setup: {self.camera_intrinsics.width}x{self.camera_intrinsics.height}, "
+            self.camera_info_received = True
+            self.get_logger().info(f"camera setup (hardcoded): {self.camera_intrinsics.width}x{self.camera_intrinsics.height}, "
                                   f"focal=({self.camera_intrinsics.fx:.1f}, {self.camera_intrinsics.fy:.1f}), "
                                   f"center=({self.camera_intrinsics.cx:.1f}, {self.camera_intrinsics.cy:.1f})")
         except Exception as e:
             self.get_logger().error(f"camera setup failed: {e}")
             raise
+    
+    def camera_info_callback(self, msg: CameraInfo):
+        # callback to receive camera intrinsics from camera_info topic
+        if self.camera_info_received:
+            return  # already got it, no need to process again
+        
+        try:
+            # extract intrinsics from K matrix [fx, 0, cx, 0, fy, cy, 0, 0, 1]
+            self.camera_intrinsics = CameraIntrinsics(
+                width=msg.width,
+                height=msg.height,
+                cx=msg.k[2],  # K[0,2]
+                cy=msg.k[5],  # K[1,2]
+                fx=msg.k[0],  # K[0,0]
+                fy=msg.k[4]   # K[1,1]
+            )
+            
+            if not self.camera_intrinsics.is_valid():
+                raise ValueError("camera parameters from camera_info are invalid!")
+            
+            self.camera_info_received = True
+            self.get_logger().info(f"camera setup (from camera_info): {self.camera_intrinsics.width}x{self.camera_intrinsics.height}, "
+                                  f"focal=({self.camera_intrinsics.fx:.1f}, {self.camera_intrinsics.fy:.1f}), "
+                                  f"center=({self.camera_intrinsics.cx:.1f}, {self.camera_intrinsics.cy:.1f})")
+            
+            # unsubscribe after getting the info (we only need it once)
+            self.destroy_subscription(self.camera_info_sub)
+            
+        except Exception as e:
+            self.get_logger().error(f"failed to parse camera_info: {e}")
+            # fall back to hardcoded values
+            self.use_camera_info = False
+            self.setup_camera()
     
     def setup_detection(self):
         # setup hsv color ranges for detecting bad fruits
@@ -200,6 +273,32 @@ class OpenCVDepthNode(Node):
         except Exception as e:
             self.get_logger().error(f"opencv setup failed: {e}")
             raise
+    
+    def setup_aruco_detector(self):
+        # setup ArUco marker detector for detecting markers like fertilizer can
+        if not self.aruco_enable:
+            self.get_logger().info("ArUco detection disabled")
+            return
+        
+        try:
+            # Use 4x4_50 dictionary (standard for competition)
+            aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+            aruco_params = cv2.aruco.DetectorParameters()
+            
+            # Tune parameters to reduce false detections
+            aruco_params.minMarkerPerimeterRate = 0.03
+            aruco_params.maxMarkerPerimeterRate = 4.0
+            aruco_params.minCornerDistanceRate = 0.05
+            aruco_params.minDistanceToBorder = 3
+            aruco_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+            
+            self.aruco_detector = cv2.aruco.ArucoDetector(aruco_dict, aruco_params)
+            
+            self.get_logger().info("ArUco detector configured (DICT_4X4_50)")
+            
+        except Exception as e:
+            self.get_logger().error(f"ArUco detector setup failed: {e}")
+            self.aruco_enable = False
     
     def setup_subs(self):
         # setup subscribers for rgb and depth camera feeds
@@ -383,12 +482,19 @@ class OpenCVDepthNode(Node):
         # this gets called when both rgb and depth images arrive at same time
         # main processing happens here
         try:
+            # wait until we have camera intrinsics before processing
+            if not self.camera_info_received:
+                return  # skip processing until camera info is received
+            
             self.frame_count += 1  # keep track of how many frames we processed
             
             # convert ros images to opencv format
             rgb_frame, depth_frame = self.convert_images(rgb_msg, depth_msg)
             if rgb_frame is None or depth_frame is None:
                 return  # skip if conversion failed
+            
+            # detect ArUco markers first (like fertilizer can)
+            aruco_detections = self.detect_aruco_markers(rgb_frame, depth_frame, rgb_msg.header.stamp)
             
             # run the actual fruit detection
             detections = self.find_bad_fruits(rgb_frame, depth_frame, rgb_msg.header.stamp)
@@ -400,7 +506,7 @@ class OpenCVDepthNode(Node):
             
             # show results in opencv windows if enabled
             if self.enable_visualization:
-                self.show_results(rgb_frame, depth_frame, detections)
+                self.show_results(rgb_frame, depth_frame, detections, aruco_detections)
             
             # print stats every 100 frames
             if self.frame_count % 100 == 0:
@@ -442,6 +548,91 @@ class OpenCVDepthNode(Node):
         except Exception as e:
             self.get_logger().error(f"image conversion failed: {e}")
             return None, None
+
+    def detect_aruco_markers(self, rgb_frame: np.ndarray, depth_frame: np.ndarray, timestamp) -> List[Tuple[int, int, int, float]]:
+        # detect ArUco markers in the frame
+        # returns list of (marker_id, center_x, center_y, depth)
+        
+        if not self.aruco_enable:
+            return []
+        
+        detections = []
+        
+        try:
+            # convert to grayscale for ArUco detection
+            gray = cv2.cvtColor(rgb_frame, cv2.COLOR_BGR2GRAY)
+            
+            # detect ArUco markers
+            corners, ids, rejected = self.aruco_detector.detectMarkers(gray)
+            
+            # process detected markers
+            if ids is not None:
+                for i, marker_id in enumerate(ids.flatten()):
+                    # get corners of this marker
+                    marker_corners = corners[i][0]
+                    
+                    # calculate marker area to filter small detections
+                    x_coords = marker_corners[:, 0]
+                    y_coords = marker_corners[:, 1]
+                    width = np.max(x_coords) - np.min(x_coords)
+                    height = np.max(y_coords) - np.min(y_coords)
+                    area = width * height
+                    
+                    # skip if marker is too small (likely false positive)
+                    if area < self.min_marker_area:
+                        self.get_logger().debug(f"skipping small ArUco ID {marker_id}, area={area:.0f}")
+                        continue
+                    
+                    # calculate center point
+                    center_x = int(np.mean(marker_corners[:, 0]))
+                    center_y = int(np.mean(marker_corners[:, 1]))
+                    
+                    # get depth at center with robust method
+                    depth = self.get_depth(depth_frame, center_x, center_y)
+                    
+                    # convert to 3D world coordinates
+                    world_x, world_y, world_z = self.convert_pixel_to_world(center_x, center_y, depth)
+                    
+                    # publish transform if valid
+                    if world_x is not None and world_y is not None and world_z is not None:
+                        # set child frame ID based on marker ID
+                        # marker ID 3 is for fertilizer can (as per competition rules)
+                        if marker_id == 3:
+                            child_frame = "1912_fertiliser_can"
+                        else:
+                            child_frame = f"1912_aruco_marker_{marker_id}"
+                        
+                        self.publish_fruit_position(child_frame, world_x, world_y, world_z, timestamp)
+                        
+                        self.aruco_stats['valid_3d'] += 1
+                        
+                        self.get_logger().info(
+                            f"ArUco ID {marker_id}: pixel=({center_x}, {center_y}), depth={depth:.3f}m, "
+                            f"3D=({world_x:.3f}, {world_y:.3f}, {world_z:.3f}), area={area:.0f}"
+                        )
+                    
+                    self.aruco_stats['total'] += 1
+                    detections.append((marker_id, center_x, center_y, depth))
+                    
+                    # draw marker center on frame
+                    cv2.circle(rgb_frame, (center_x, center_y), 5, (0, 0, 255), -1)
+                    
+                    # add text label
+                    if world_x is not None:
+                        if marker_id == 3:
+                            text = f"Fertiliser Can: D={depth:.2f}m"
+                        else:
+                            text = f"ArUco {marker_id}: D={depth:.2f}m"
+                        cv2.putText(rgb_frame, text, (center_x - 80, center_y - 20),
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+                
+                # draw detected marker outlines
+                cv2.aruco.drawDetectedMarkers(rgb_frame, corners, ids)
+        
+        except Exception as e:
+            self.get_logger().error(f"ArUco detection failed: {e}")
+        
+        return detections
 
     def find_bad_fruits(self, rgb_frame: np.ndarray, depth_frame: np.ndarray, timestamp) -> List[DetectionResult]:
         # main detection function - finds bad fruits using hsv color detection
@@ -585,7 +776,7 @@ class OpenCVDepthNode(Node):
         # old function name kept for compatibility (just calls the robust version)
         return self.get_depth(depth_frame, x, y, window_size=1)
     
-    def show_results(self, rgb_frame: np.ndarray, depth_frame: np.ndarray, detections: List[DetectionResult]):
+    def show_results(self, rgb_frame: np.ndarray, depth_frame: np.ndarray, detections: List[DetectionResult], aruco_detections: List = []):
         # show detection results in opencv windows (helps with debugging)
         try:
             # make copies so we dont mess up original images
@@ -598,7 +789,7 @@ class OpenCVDepthNode(Node):
                 self.draw_detection_on_depth(depth_colormap, detection)
             
             # add some info text at top
-            info_text = f"Frame: {self.frame_count} | Found: {len(detections)} | With 3D: {sum(1 for d in detections if d.has_valid_3d)}"
+            info_text = f"Frame: {self.frame_count} | Fruits: {len(detections)} | ArUco: {len(aruco_detections)} | 3D: {sum(1 for d in detections if d.has_valid_3d)}"
             cv2.putText(rgb_vis, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             
             # show the images in windows
@@ -707,15 +898,27 @@ class OpenCVDepthNode(Node):
         valid = self.detection_stats['valid_3d']
         invalid = self.detection_stats['invalid_depth']
         
-        if total > 0:
-            success_rate = (valid / total) * 100
-            self.get_logger().info(
-                f"stats (last 100 frames): found={total}, got_3d={valid} ({success_rate:.1f}%), "
-                f"bad_depth={invalid}, frames={self.frame_count}"
-            )
+        aruco_total = self.aruco_stats['total']
+        aruco_valid = self.aruco_stats['valid_3d']
+        
+        if total > 0 or aruco_total > 0:
+            if total > 0:
+                success_rate = (valid / total) * 100
+                self.get_logger().info(
+                    f"Fruit stats (last 100 frames): found={total}, got_3d={valid} ({success_rate:.1f}%), "
+                    f"bad_depth={invalid}"
+                )
+            
+            if aruco_total > 0:
+                self.get_logger().info(
+                    f"ArUco stats (last 100 frames): found={aruco_total}, got_3d={aruco_valid}"
+                )
+            
+            self.get_logger().info(f"Total frames processed: {self.frame_count}")
         
         # reset counters for next 100 frames
         self.detection_stats = {'total': 0, 'valid_3d': 0, 'invalid_depth': 0}
+        self.aruco_stats = {'total': 0, 'valid_3d': 0}
     
     def create_depth_colormap(self, depth_frame: np.ndarray) -> np.ndarray:
         # old function name (kept for compatibility)
