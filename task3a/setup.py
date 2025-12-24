@@ -22,7 +22,8 @@ setup(
         'console_scripts': [
             'detection = task3a.detection:main',
             'hsv_calibration = task3a.hsv_calibration:main',
-            
+            'manipulation = task3a.manipulation:main',
+            'campub = task3a.campub:main',
         ],
     },
 )
