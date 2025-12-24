@@ -255,12 +255,12 @@ class OpenCVDepthNode(Node):
         try:
             # these hsv values were found using trackbars (took forever to tune!)
             # gray fruit body: 
-            self.grey_lower = np.array([12, 0, 25])
-            self.grey_upper = np.array([147, 64, 125])
+            self.grey_lower = np.array([14, 6, 73])
+            self.grey_upper = np.array([124, 39, 124])
             
             # green moldy spots:
-            self.green_lower = np.array([50, 66, 179])
-            self.green_upper = np.array([56, 105, 203])
+            self.green_lower = np.array([49, 67, 182])
+            self.green_upper = np.array([59, 125, 196])
             
             # minimum sizes for detection
             self.min_contour_area = 500  # fruit must be atleast this big
